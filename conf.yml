@@ -1,0 +1,37 @@
+info:
+  name: "PRM Auto Deploy"
+  identifier: "prmautodeploy"
+  description: "Admin Servers sayfasından egg seçip toplu sunucu açar; aynı egg'in hazır kurulumundan 68GB oyun dosyalarını hardlink ile paylaşır, cfg/plugin/map yönetimini sunucu başına ayırır."
+  flags: ""
+  version: "1.0.0"
+  target: "beta-2026-08"
+  author: "Peto"
+  icon: ""
+  website: ""
+
+admin:
+  view: "view.blade.php"
+  controller: ""
+  css: "admin.css"
+  wrapper: "admin/wrapper.blade.php"
+
+dashboard:
+  css: ""
+  wrapper: ""
+  components: ""
+
+data:
+  directory: ""
+  public: ""
+  console: ""
+
+requests:
+  views: ""
+  app: ""
+  routers:
+    application: ""
+    client: ""
+    web: "routes/web.php"
+
+database:
+  migrations: ""
