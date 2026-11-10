@@ -9,10 +9,88 @@ use Pterodactyl\Models\Node;
 use Pterodactyl\Models\Server;
 use Pterodactyl\Models\User;
 use Pterodactyl\Services\Servers\ServerCreationService;
+use Pterodactyl\Services\Servers\ServerDeletionService;
 
-$volumesRoot = '/peto-volumes';
+$volumeRoots = ['/peto-volumes', '/data'];
 
-$donorForEgg = static function (int $eggId) use ($volumesRoot): ?Server {
+$helperUrls = static function (?Node $node = null): array {
+    $urls = [];
+    $env = trim((string) env('PRM_SHARE_HELPER_URL', ''));
+    if ($env !== '') {
+        $urls[] = rtrim($env, '/');
+    }
+    $urls[] = 'http://prm-share-helper:8099';
+    $hosts = [];
+    if ($node && $node->fqdn) {
+        $hosts[] = $node->fqdn;
+    }
+    foreach (Node::query()->orderBy('id')->get(['fqdn']) as $item) {
+        if ($item->fqdn) {
+            $hosts[] = $item->fqdn;
+        }
+    }
+    foreach (array_unique($hosts) as $host) {
+        $urls[] = 'http://' . $host . ':8099';
+    }
+
+    return array_values(array_unique($urls));
+};
+
+$helperPost = static function (string $path, array $payload, ?Node $node = null) use ($helperUrls): array {
+    $lastError = 'Share helper unreachable';
+    foreach ($helperUrls($node) as $base) {
+        $ch = curl_init($base . $path);
+        curl_setopt_array($ch, [
+            CURLOPT_POST => true,
+            CURLOPT_HTTPHEADER => ['Content-Type: application/json', 'Accept: application/json'],
+            CURLOPT_POSTFIELDS => json_encode($payload),
+            CURLOPT_RETURNTRANSFER => true,
+            CURLOPT_CONNECTTIMEOUT => 3,
+            CURLOPT_TIMEOUT => 600,
+        ]);
+        $raw = curl_exec($ch);
+        $errno = curl_errno($ch);
+        $err = curl_error($ch);
+        $http = (int) curl_getinfo($ch, CURLINFO_HTTP_CODE);
+        curl_close($ch);
+
+        if ($errno) {
+            $lastError = "Share helper unreachable ({$base}): {$err}";
+            continue;
+        }
+
+        $body = json_decode((string) $raw, true) ?: [];
+        if ($http >= 400 || (array_key_exists('ok', $body) && empty($body['ok']))) {
+            $log = is_array($body['log'] ?? null) ? $body['log'] : [];
+            $msg = $body['error'] ?? implode(' | ', array_slice($log, -6));
+            throw new RuntimeException("Share helper HTTP {$http}: {$msg}");
+        }
+
+        return $body;
+    }
+
+    throw new RuntimeException($lastError);
+};
+
+$localDonor = static function (Server $server) use ($volumeRoots): bool {
+    foreach ($volumeRoots as $root) {
+        $path = $root . '/' . $server->uuid;
+        if (is_dir($path . '/game') || is_file($path . '/game/cs2.sh') || is_dir($path . '/steamapps')) {
+            return true;
+        }
+        if (!is_dir($path)) {
+            continue;
+        }
+        $entries = array_diff(scandir($path) ?: [], ['.', '..', '.sftp']);
+        if (count($entries) >= 2) {
+            return true;
+        }
+    }
+
+    return false;
+};
+
+$donorForEgg = static function (int $eggId, ?Node $node = null) use ($localDonor, $helperPost): ?Server {
     $candidates = Server::query()
         ->where('egg_id', $eggId)
         ->whereNull('status')
@@ -20,16 +98,25 @@ $donorForEgg = static function (int $eggId) use ($volumesRoot): ?Server {
         ->get();
 
     foreach ($candidates as $server) {
-        $path = $volumesRoot . '/' . $server->uuid;
-        if (is_dir($path . '/game') || is_file($path . '/game/cs2.sh') || is_dir($path . '/steamapps')) {
+        if ($localDonor($server)) {
             return $server;
         }
-        // generic: non-trivial volume
-        if (is_dir($path)) {
-            $entries = array_diff(scandir($path) ?: [], ['.', '..', '.sftp']);
-            if (count($entries) >= 2) {
-                return $server;
-            }
+    }
+
+    if ($candidates->isEmpty()) {
+        return null;
+    }
+
+    try {
+        $body = $helperPost('/lookup', ['uuids' => $candidates->pluck('uuid')->all()], $node);
+    } catch (Throwable $e) {
+        return null;
+    }
+
+    $found = array_fill_keys($body['donors'] ?? [], true);
+    foreach ($candidates as $server) {
+        if (isset($found[$server->uuid])) {
+            return $server;
         }
     }
 
@@ -44,12 +131,13 @@ $nextPorts = static function (Node $node, int $count, ?int $startPort): array {
         ->all();
     $usedSet = array_fill_keys($used, true);
 
-    $port = $startPort ?: 27015;
-    if ($startPort === null) {
-        // pick first free from 27015 upward for game-ish defaults, else any free
-        $port = 27015;
-        while (isset($usedSet[$port]) && $port < 65535) {
-            $port++;
+    if ($startPort !== null) {
+        $port = $startPort;
+    } else {
+        $maxUsed = $used ? max($used) : 25564;
+        $port = $maxUsed + 1;
+        if ($port < 1024) {
+            $port = 25565;
         }
     }
 
@@ -69,11 +157,28 @@ $nextPorts = static function (Node $node, int $count, ?int $startPort): array {
     return $ports;
 };
 
-$ensureAllocation = static function (Node $node, int $port): Allocation {
+$allocationIp = static function (Node $node): string {
+    $ip = Allocation::query()
+        ->where('node_id', $node->id)
+        ->where('ip', '!=', '0.0.0.0')
+        ->where('ip', '!=', '::')
+        ->value('ip');
+    if (is_string($ip) && $ip !== '') {
+        return $ip;
+    }
+    if (filter_var((string) $node->fqdn, FILTER_VALIDATE_IP)) {
+        return (string) $node->fqdn;
+    }
+
+    return '0.0.0.0';
+};
+
+$ensureAllocation = static function (Node $node, int $port) use ($allocationIp): Allocation {
+    $ip = $allocationIp($node);
     $alloc = Allocation::query()->firstOrCreate(
         [
             'node_id' => $node->id,
-            'ip' => '0.0.0.0',
+            'ip' => $ip,
             'port' => $port,
         ],
         [
@@ -89,59 +194,29 @@ $ensureAllocation = static function (Node $node, int $port): Allocation {
     return $alloc;
 };
 
-$shareFromDonor = static function (string $donorUuid, string $newUuid) use ($volumesRoot): array {
-    $src = $volumesRoot . '/' . $donorUuid;
-    $dst = $volumesRoot . '/' . $newUuid;
+$shareFromDonor = static function (string $donorUuid, string $newUuid, ?Node $node = null) use ($helperPost): array {
+    $body = $helperPost('/share', ['donor' => $donorUuid, 'target' => $newUuid], $node);
 
-    if (!is_dir($src)) {
-        throw new RuntimeException("Donor volume missing: {$src}");
-    }
-
-    // Wait for Wings volume folder (created as uid 988 — nginx cannot write into it)
-    for ($w = 0; $w < 40; $w++) {
-        if (is_dir($dst)) {
-            break;
-        }
-        usleep(250000);
-    }
-    if (!is_dir($dst)) {
-        throw new RuntimeException("New volume missing: {$dst}");
-    }
-
-    $payload = json_encode(['donor' => $donorUuid, 'target' => $newUuid]);
-    $ch = curl_init('http://prm-share-helper:8099/share');
-    curl_setopt_array($ch, [
-        CURLOPT_POST => true,
-        CURLOPT_HTTPHEADER => ['Content-Type: application/json', 'Accept: application/json'],
-        CURLOPT_POSTFIELDS => $payload,
-        CURLOPT_RETURNTRANSFER => true,
-        CURLOPT_TIMEOUT => 600,
-    ]);
-    $raw = curl_exec($ch);
-    $errno = curl_errno($ch);
-    $err = curl_error($ch);
-    $http = (int) curl_getinfo($ch, CURLINFO_HTTP_CODE);
-    curl_close($ch);
-
-    if ($errno) {
-        throw new RuntimeException("Share helper unreachable: {$err}");
-    }
-
-    $body = json_decode((string) $raw, true) ?: [];
-    $log = is_array($body['log'] ?? null) ? $body['log'] : [trim((string) $raw)];
-    if ($http >= 400 || empty($body['ok'])) {
-        $msg = $body['error'] ?? implode(' | ', array_slice($log, -6));
-        throw new RuntimeException("Share failed (HTTP {$http}): {$msg}");
-    }
-
-    if (!is_file("{$dst}/game/cs2.sh") && !is_dir("{$dst}/game")) {
-        throw new RuntimeException('Share finished but game/ is still missing on the new volume.');
-    }
-
-    return $log;
+    return is_array($body['log'] ?? null) ? $body['log'] : [];
 };
 
-Route::get('/meta', function () use ($donorForEgg) {
+$discardServer = static function (?Server $server): void {
+    if (!$server || !$server->id) {
+        return;
+    }
+    try {
+        $deletion = app(ServerDeletionService::class);
+        if (method_exists($deletion, 'withForce')) {
+            $deletion->withForce(true)->handle($server);
+        } else {
+            $deletion->handle($server);
+        }
+    } catch (Throwable $e) {
+        // Keep the original deploy error; cleanup is best-effort.
+    }
+};
+
+Route::get('/meta', function () use ($donorForEgg, $volumeRoots) {
     $eggs = Egg::query()->orderBy('name')->get(['id', 'name', 'nest_id', 'author']);
     $nodes = Node::query()->orderBy('name')->get(['id', 'name', 'fqdn']);
     $owners = User::query()->orderBy('id')->limit(50)->get(['id', 'username', 'email']);
@@ -162,21 +237,23 @@ Route::get('/meta', function () use ($donorForEgg) {
         ];
     })->values();
 
+    $mounted = false;
+    foreach ($volumeRoots as $root) {
+        if (is_dir($root)) {
+            $mounted = true;
+            break;
+        }
+    }
+
     return response()->json([
         'eggs' => $eggMeta,
         'nodes' => $nodes,
         'owners' => $owners,
-        'volumes_mounted' => is_dir('/peto-volumes'),
+        'volumes_mounted' => $mounted,
     ]);
 })->middleware(['auth', AdminAuthenticate::class]);
 
-Route::post('/deploy', function (Request $request) use ($donorForEgg, $nextPorts, $ensureAllocation, $shareFromDonor, $volumesRoot) {
-    if (!is_dir($volumesRoot)) {
-        return response()->json([
-            'error' => 'Panel cannot see /peto-volumes. Mount D:/PETO-FILES/volumes into the panel container.',
-        ], 500);
-    }
-
+Route::post('/deploy', function (Request $request) use ($donorForEgg, $nextPorts, $ensureAllocation, $shareFromDonor, $discardServer) {
     $data = $request->validate([
         'egg_id' => 'required|integer|exists:eggs,id',
         'node_id' => 'required|integer|exists:nodes,id',
@@ -194,7 +271,7 @@ Route::post('/deploy', function (Request $request) use ($donorForEgg, $nextPorts
 
     $egg = Egg::query()->with('variables')->findOrFail($data['egg_id']);
     $node = Node::query()->findOrFail($data['node_id']);
-    $donor = $donorForEgg((int) $egg->id);
+    $donor = $donorForEgg((int) $egg->id, $node);
 
     if (!$donor) {
         return response()->json([
@@ -212,6 +289,7 @@ Route::post('/deploy', function (Request $request) use ($donorForEgg, $nextPorts
     for ($i = 0; $i < $count; $i++) {
         $port = $ports[$i];
         $name = sprintf('%s-%02d', preg_replace('/\s+/', '-', trim($data['name_prefix'])), $i + 1);
+        $server = null;
 
         try {
             $alloc = $ensureAllocation($node, $port);
@@ -220,7 +298,6 @@ Route::post('/deploy', function (Request $request) use ($donorForEgg, $nextPorts
             foreach ($egg->variables as $variable) {
                 $environment[$variable->env_variable] = (string) ($variable->default_value ?? '');
             }
-            // CS2 / KitsuneLab friendly defaults when vars exist
             if (array_key_exists('ALLOW_TOKENLESS', $environment)) {
                 $environment['ALLOW_TOKENLESS'] = '1';
             }
@@ -231,7 +308,6 @@ Route::post('/deploy', function (Request $request) use ($donorForEgg, $nextPorts
                 $environment['SRCDS_VALIDATE'] = '0';
             }
             if (array_key_exists('CUSTOM_PARAMS', $environment)) {
-                // Local multi-instance: LAN + no VAC; avoids empty +sv_setsteamaccount eating +game_type
                 $environment['CUSTOM_PARAMS'] = '+sv_lan 1 -insecure';
             }
             if (array_key_exists('STEAM_ACC', $environment)) {
@@ -243,14 +319,12 @@ Route::post('/deploy', function (Request $request) use ($donorForEgg, $nextPorts
             if (!empty($data['maxplayers']) && array_key_exists('SRCDS_MAXPLAYERS', $environment)) {
                 $environment['SRCDS_MAXPLAYERS'] = (string) ((int) $data['maxplayers']);
             }
-            // Don't reinstall plugins onto shared donor tree during first boot
             foreach (['INSTALL_METAMOD', 'INSTALL_CSS', 'INSTALL_SWIFTLY', 'INSTALL_MODSHARP'] as $flag) {
                 if (array_key_exists($flag, $environment)) {
                     $environment[$flag] = '0';
                 }
             }
 
-            // Empty +sv_setsteamaccount {{STEAM_ACC}} steals next arg (+game_type) → broken servers
             $startup = (string) $egg->startup;
             if ($environment['STEAM_ACC'] === '' || !array_key_exists('STEAM_ACC', $environment)) {
                 $startup = preg_replace('/\s*\+sv_setsteamaccount\s*\{\{STEAM_ACC\}\}/', '', $startup) ?? $startup;
@@ -282,19 +356,8 @@ Route::post('/deploy', function (Request $request) use ($donorForEgg, $nextPorts
 
             /** @var Server $server */
             $server = app(ServerCreationService::class)->handle($payload);
+            $shareLog = $shareFromDonor($donor->uuid, $server->uuid, $node);
 
-            // Wait briefly for Wings volume folder
-            $dst = $volumesRoot . '/' . $server->uuid;
-            for ($w = 0; $w < 20; $w++) {
-                if (is_dir($dst)) {
-                    break;
-                }
-                usleep(250000);
-            }
-
-            $shareLog = $shareFromDonor($donor->uuid, $server->uuid);
-
-            // Mark installed
             $server->status = null;
             $server->save();
 
@@ -316,6 +379,7 @@ Route::post('/deploy', function (Request $request) use ($donorForEgg, $nextPorts
                 'share' => $shareLog,
             ];
         } catch (Throwable $e) {
+            $discardServer($server);
             $errors[] = [
                 'name' => $name,
                 'port' => $port,
@@ -335,7 +399,7 @@ Route::post('/deploy', function (Request $request) use ($donorForEgg, $nextPorts
     ]);
 })->middleware(['auth', AdminAuthenticate::class]);
 
-Route::post('/repair', function (Request $request) use ($donorForEgg, $shareFromDonor, $volumesRoot) {
+Route::post('/repair', function (Request $request) use ($donorForEgg, $shareFromDonor, $helperPost, $localDonor) {
     $data = $request->validate([
         'egg_id' => 'required|integer|exists:eggs,id',
         'start_after' => 'nullable|boolean',
@@ -352,12 +416,20 @@ Route::post('/repair', function (Request $request) use ($donorForEgg, $shareFrom
         ->orderBy('id')
         ->get();
 
+    $remoteDonors = [];
+    try {
+        $remoteDonors = array_fill_keys($helperPost('/lookup', [
+            'uuids' => $servers->pluck('uuid')->all(),
+        ])['donors'] ?? [], true);
+    } catch (Throwable $e) {
+        $remoteDonors = [];
+    }
+
     $fixed = [];
     $errors = [];
 
     foreach ($servers as $server) {
-        $game = $volumesRoot . '/' . $server->uuid . '/game/cs2.sh';
-        if (is_file($game)) {
+        if ($localDonor($server) || isset($remoteDonors[$server->uuid])) {
             continue;
         }
         try {

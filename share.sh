@@ -1,13 +1,20 @@
 #!/bin/sh
-# Runs as root inside alpine with /data = PETO-FILES/volumes
+# Hardlink a donor Wings volume onto a new server volume. Same filesystem only.
 set -e
-SRC="/data/$1"
-DST="/data/$2"
+DATA="${PRM_VOLUMES:-/data}"
+SRC="$DATA/$1"
+DST="$DATA/$2"
 
 if [ ! -d "$SRC" ]; then
   echo "donor missing: $SRC" >&2
   exit 1
 fi
+
+i=0
+while [ ! -d "$DST" ] && [ "$i" -lt 40 ]; do
+  sleep 0.25
+  i=$((i + 1))
+done
 if [ ! -d "$DST" ]; then
   mkdir -p "$DST"
 fi
