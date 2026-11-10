@@ -3,7 +3,7 @@ info:
   identifier: "prmautodeploy"
   description: "Admin Servers sayfasından egg seçip toplu sunucu açar; aynı egg'in hazır kurulumundan 68GB oyun dosyalarını hardlink ile paylaşır, cfg/plugin/map yönetimini sunucu başına ayırır."
   flags: ""
-  version: "1.1.0"
+  version: "1.2.0"
   target: "beta-2026-08"
   author: "Peto"
   icon: ""

@@ -11,15 +11,45 @@ use Pterodactyl\Models\User;
 use Pterodactyl\Services\Servers\ServerCreationService;
 use Pterodactyl\Services\Servers\ServerDeletionService;
 
-$volumeRoots = ['/peto-volumes', '/data'];
+$volumeRoots = static function (?Node $node = null): array {
+    $roots = [];
+    $env = trim((string) env('PRM_VOLUMES', ''));
+    if ($env !== '') {
+        foreach (preg_split('/[,;]+/', $env) ?: [] as $part) {
+            $part = rtrim(trim($part), '/');
+            if ($part !== '') {
+                $roots[] = $part;
+            }
+        }
+    }
+    if ($node && !empty($node->daemonBase)) {
+        $roots[] = rtrim((string) $node->daemonBase, '/');
+    }
+    foreach (['/data', '/var/lib/pterodactyl/volumes', '/peto-volumes', '/srv/daemon-data', '/srv/pterodactyl/volumes'] as $path) {
+        $roots[] = $path;
+    }
+
+    return array_values(array_unique($roots));
+};
 
 $helperUrls = static function (?Node $node = null): array {
     $urls = [];
     $env = trim((string) env('PRM_SHARE_HELPER_URL', ''));
     if ($env !== '') {
-        $urls[] = rtrim($env, '/');
+        foreach (preg_split('/[,;]+/', $env) ?: [] as $part) {
+            $part = rtrim(trim($part), '/');
+            if ($part !== '') {
+                $urls[] = $part;
+            }
+        }
     }
-    $urls[] = 'http://prm-share-helper:8099';
+    foreach ([
+        'http://prm-share-helper:8099',
+        'http://host.docker.internal:8099',
+        'http://127.0.0.1:8099',
+    ] as $builtin) {
+        $urls[] = $builtin;
+    }
     $hosts = [];
     if ($node && $node->fqdn) {
         $hosts[] = $node->fqdn;
@@ -36,7 +66,8 @@ $helperUrls = static function (?Node $node = null): array {
     return array_values(array_unique($urls));
 };
 
-$helperPost = static function (string $path, array $payload, ?Node $node = null) use ($helperUrls): array {
+$helperPost = static function (string $path, array $payload, ?Node $node = null) use ($helperUrls, $volumeRoots): array {
+    $payload['roots'] = array_values(array_merge($payload['roots'] ?? [], $volumeRoots($node)));
     $lastError = 'Share helper unreachable';
     foreach ($helperUrls($node) as $base) {
         $ch = curl_init($base . $path);
@@ -60,6 +91,10 @@ $helperPost = static function (string $path, array $payload, ?Node $node = null)
         }
 
         $body = json_decode((string) $raw, true) ?: [];
+        if ($http === 404) {
+            $lastError = "Share helper {$base} has no {$path}";
+            continue;
+        }
         if ($http >= 400 || (array_key_exists('ok', $body) && empty($body['ok']))) {
             $log = is_array($body['log'] ?? null) ? $body['log'] : [];
             $msg = $body['error'] ?? implode(' | ', array_slice($log, -6));
@@ -72,8 +107,11 @@ $helperPost = static function (string $path, array $payload, ?Node $node = null)
     throw new RuntimeException($lastError);
 };
 
-$localDonor = static function (Server $server) use ($volumeRoots): bool {
-    foreach ($volumeRoots as $root) {
+$localDonor = static function (Server $server, ?Node $node = null) use ($volumeRoots): bool {
+    foreach ($volumeRoots($node) as $root) {
+        if (!is_dir($root)) {
+            continue;
+        }
         $path = $root . '/' . $server->uuid;
         if (is_dir($path . '/game') || is_file($path . '/game/cs2.sh') || is_dir($path . '/steamapps')) {
             return true;
@@ -92,13 +130,14 @@ $localDonor = static function (Server $server) use ($volumeRoots): bool {
 
 $donorForEgg = static function (int $eggId, ?Node $node = null) use ($localDonor, $helperPost): ?Server {
     $candidates = Server::query()
+        ->with('node')
         ->where('egg_id', $eggId)
         ->whereNull('status')
         ->orderBy('id')
         ->get();
 
     foreach ($candidates as $server) {
-        if ($localDonor($server)) {
+        if ($localDonor($server, $node ?: $server->node)) {
             return $server;
         }
     }
@@ -238,7 +277,7 @@ Route::get('/meta', function () use ($donorForEgg, $volumeRoots) {
     })->values();
 
     $mounted = false;
-    foreach ($volumeRoots as $root) {
+    foreach ($volumeRoots() as $root) {
         if (is_dir($root)) {
             $mounted = true;
             break;
@@ -429,7 +468,7 @@ Route::post('/repair', function (Request $request) use ($donorForEgg, $shareFrom
     $errors = [];
 
     foreach ($servers as $server) {
-        if ($localDonor($server) || isset($remoteDonors[$server->uuid])) {
+        if ($localDonor($server, $server->node) || isset($remoteDonors[$server->uuid])) {
             continue;
         }
         try {

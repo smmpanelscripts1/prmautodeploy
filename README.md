@@ -6,13 +6,15 @@ Create multiple game servers from the Admin → Servers page. Pick an egg and a 
 
 ## Version
 
-`1.1.0`
+`1.2.0`
 
 ## Notes
 
 - Designed for large shared installs (for example CS2 on a host volume)
 - Uses a small host helper for hardlink share when the panel PHP user cannot write Wings volumes
-- Donor lookup can run on the Wings node via `/lookup` when `/peto-volumes` is not mounted into the panel
+- Donor lookup can run on the Wings node via `/lookup` when volumes are not mounted into the panel
+- Volume root is auto-detected (`/data`, `/var/lib/pterodactyl/volumes`, `/peto-volumes`, node `daemon_base`, `PRM_VOLUMES`)
+- Helper URL is auto-detected (`PRM_SHARE_HELPER_URL`, Docker DNS, `host.docker.internal`, node FQDN `:8099`)
 - Allocations reuse the node's real IP and the next free port after existing allocations
 - Share failures roll the new server record back instead of leaving an empty install
 - `share.sh` must be LF; CRLF makes `sh` fail with `set: Illegal option -`
